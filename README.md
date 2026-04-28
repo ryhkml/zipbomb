@@ -36,8 +36,11 @@ gcc -O2 -Wall -Wextra -Wformat -Wformat-security -fstack-protector-strong -std=c
 ./zipbomb [OPTIONS]
 
 Options:
-    --host [addr]        Set Zip Bomb host (default: 127.0.0.1)
-    --port [4000-65535]  Set Zip Bomb port (default: 32000)
+    --host [addr]              Set Zip Bomb host (default: 127.0.0.1)
+    --port [4000-65535]        Set Zip Bomb port (default: 32000)
+    --file [path]              Set GZIP bomb file path (default: data.gzip)
+    --workers [1-128]          Set worker process count (default: 4)
+    --send-timeout [1-300]     Set per-client send timeout in seconds (default: 5)
 ```
 
 Use nginx as a reverse proxy. An example configuration is in [nginx.conf](./nginx.conf).

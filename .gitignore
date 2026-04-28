@@ -1,5 +1,8 @@
 zipbomb
 
+.env
+
 data.gzip
+deploy.sh
 diff.txt
 note.txt
