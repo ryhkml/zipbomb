@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -50,6 +51,7 @@ void print_usage(const char *name);
 static bool parse_long_arg(const char *value, long min, long max, const char *name, long *out);
 static char *resolve_payload_path(const char *path);
 static bool validate_payload_file(const char *path);
+static bool client_accepts_gzip(int client_fd);
 static bool configure_signal_handlers(void);
 static bool set_send_timeout(int fd, int seconds);
 static int create_server_socket(const server_config_t *config);
@@ -226,6 +228,14 @@ void handle_signal(int signal) {
 }
 
 void handle_connection(int client_fd, const server_config_t *config) {
+    if (!client_accepts_gzip(client_fd)) {
+        // No gzip support advertised: the bomb can't inflate on this client, so
+        // don't waste bandwidth sending it. Give a plain 404.
+        const char *not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        write_all(client_fd, not_found, strlen(not_found));
+        return;
+    }
+
     if (write_all(client_fd, config->header, (size_t)config->header_len) == -1) return;
 
     // sendfile with an explicit offset uses pread semantics: it never touches
@@ -254,6 +264,30 @@ void handle_connection(int client_fd, const server_config_t *config) {
     while (drained < DRAIN_LIMIT && (n = read(client_fd, sink, sizeof(sink))) > 0) {
         drained += (size_t)n;
     }
+}
+
+// Reads the request headers (bounded by the buffer and the recv timeout) and
+// reports whether the client advertised gzip. ponytail: ignores qvalues
+// (gzip;q=0) and any header past 8 KiB; good enough for scanner traffic.
+static bool client_accepts_gzip(int client_fd) {
+    char buf[8192];
+    size_t total = 0;
+    while (total < sizeof(buf) - 1) {
+        ssize_t n = read(client_fd, buf + total, sizeof(buf) - 1 - total);
+        if (n <= 0) break;
+        total += (size_t)n;
+        if (memmem(buf, total, "\r\n\r\n", 4) != NULL) break;
+    }
+    buf[total] = '\0';
+
+    for (size_t i = 0; i < total; i++) buf[i] = (char)tolower((unsigned char)buf[i]);
+
+    char *header = strstr(buf, "accept-encoding:");
+    if (header == NULL) return false;
+
+    char *eol = strstr(header, "\r\n");
+    if (eol != NULL) *eol = '\0';
+    return strstr(header, "gzip") != NULL;
 }
 
 ssize_t write_all(int fd, const void *buf, size_t count) {

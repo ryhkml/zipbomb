@@ -7,6 +7,8 @@ Serve a GZIP bomb as a defense mechanism against malicious requests.
 Zip Bomb creates a server that responds to requests with a pre-generated GZIP bomb file (data.gzip).
 It is designed to target attackers or scanners by sending a large decompressed file (~10GB) hidden in a small compressed form (~10MB).
 
+The server only sends the bomb to clients that advertise `Accept-Encoding: gzip` — those are the ones that will decompress it and choke. Any other client (e.g. plain `curl` with no `Accept-Encoding`) gets a plain `404` instead, so no bandwidth is wasted on a target that can't inflate the payload.
+
 ## Background
 
 The inspiration stems from the common issue of web server exposure to malicious scans, as highlighted in a Mastodon post by [@Viss](https://mastodon.social/@Viss/114864117312657608) on July 17, 2025, at 2:23 AM.
@@ -47,6 +49,9 @@ Use nginx as a reverse proxy. An example configuration is in [nginx.conf](./ngin
 
 > [!CAUTION]
 > Do not enable `gunzip on;` on the proxy. The upstream serves a pre-gzipped body that inflates to ~10GB; `gunzip` would decompress it on your own nginx server and OOM you instead of the scanner.
+
+> [!NOTE]
+> The server gates on `Accept-Encoding: gzip`, so the proxy must forward that header. nginx forwards it to the upstream by default — do not clear it with `proxy_set_header Accept-Encoding "";` or every request will get a `404` instead of the bomb.
 
 ## Related Article
 
