@@ -134,7 +134,7 @@ int main(int argc, char **argv) {
                                  "HTTP/1.1 200 OK\r\n"
                                  "Cache-Control: no-cache, no-store, must-revalidate\r\n"
                                  "Content-Encoding: gzip\r\n"
-                                 "Content-Type: application/octet-stream\r\n"
+                                 "Content-Type: text/html\r\n"
                                  "Content-Length: %jd\r\n"
                                  "Connection: close\r\n"
                                  "\r\n",
