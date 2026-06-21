@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -23,23 +24,26 @@
 #define DEFAULT_PORT 32000
 #define DEFAULT_WORKERS 4
 #define DEFAULT_SEND_TIMEOUT 5
-#define BACKLOG 10
-#define CHUNK_SIZE 4096
+#define BACKLOG SOMAXCONN
 #define BOMB_FILE "data.gzip"
 #define MAX_WORKERS 128
+#define DRAIN_LIMIT (64 * 1024)
 
 typedef struct {
     const char *host;
-    const char *bomb_path;
     uint16_t port;
     int workers;
     int send_timeout;
+    int bomb_fd;
+    off_t bomb_size;
+    char header[512];
+    int header_len;
 } server_config_t;
 
 static volatile sig_atomic_t running = true;
 
 void handle_signal(int signal);
-void handle_connection(int client_fd, const char *bomb_path);
+void handle_connection(int client_fd, const server_config_t *config);
 ssize_t write_all(int fd, const void *buf, size_t count);
 void print_usage(const char *name);
 
@@ -59,7 +63,6 @@ int main(int argc, char **argv) {
     const char *payload_arg = BOMB_FILE;
     server_config_t config = {
         .host = DEFAULT_HOST,
-        .bomb_path = NULL,
         .port = DEFAULT_PORT,
         .workers = DEFAULT_WORKERS,
         .send_timeout = DEFAULT_SEND_TIMEOUT,
@@ -105,21 +108,52 @@ int main(int argc, char **argv) {
 
     char *resolved_payload_path = resolve_payload_path(payload_arg);
     if (resolved_payload_path == NULL) return EXIT_FAILURE;
-    config.bomb_path = resolved_payload_path;
 
-    if (!validate_payload_file(config.bomb_path)) {
+    if (!validate_payload_file(resolved_payload_path)) {
         free(resolved_payload_path);
         return EXIT_FAILURE;
     }
 
-    if (!configure_signal_handlers()) {
+    config.bomb_fd = open(resolved_payload_path, O_RDONLY);
+    if (config.bomb_fd == -1) {
+        perror("Failed to open bomb file");
         free(resolved_payload_path);
+        return EXIT_FAILURE;
+    }
+
+    struct stat bomb_stat;
+    if (fstat(config.bomb_fd, &bomb_stat) == -1) {
+        perror("Failed to stat bomb file");
+        close(config.bomb_fd);
+        free(resolved_payload_path);
+        return EXIT_FAILURE;
+    }
+    config.bomb_size = bomb_stat.st_size;
+
+    config.header_len = snprintf(config.header, sizeof(config.header),
+                                 "HTTP/1.1 200 OK\r\n"
+                                 "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+                                 "Content-Encoding: gzip\r\n"
+                                 "Content-Type: application/octet-stream\r\n"
+                                 "Content-Length: %jd\r\n"
+                                 "Connection: close\r\n"
+                                 "\r\n",
+                                 (intmax_t)config.bomb_size);
+    free(resolved_payload_path);
+    if (config.header_len < 0 || (size_t)config.header_len >= sizeof(config.header)) {
+        fprintf(stderr, "Failed to build response header\n");
+        close(config.bomb_fd);
+        return EXIT_FAILURE;
+    }
+
+    if (!configure_signal_handlers()) {
+        close(config.bomb_fd);
         return EXIT_FAILURE;
     }
 
     int server_fd = create_server_socket(&config);
     if (server_fd == -1) {
-        free(resolved_payload_path);
+        close(config.bomb_fd);
         return EXIT_FAILURE;
     }
 
@@ -127,7 +161,7 @@ int main(int argc, char **argv) {
     if (pids == NULL) {
         perror("Failed to allocate worker table");
         close(server_fd);
-        free(resolved_payload_path);
+        close(config.bomb_fd);
         return EXIT_FAILURE;
     }
 
@@ -142,7 +176,7 @@ int main(int argc, char **argv) {
             wait_for_workers(pids, config.workers);
             close(server_fd);
             free(pids);
-            free(resolved_payload_path);
+            close(config.bomb_fd);
             return EXIT_FAILURE;
         }
         live_workers++;
@@ -182,7 +216,7 @@ int main(int argc, char **argv) {
 
     close(server_fd);
     free(pids);
-    free(resolved_payload_path);
+    close(config.bomb_fd);
     return EXIT_SUCCESS;
 }
 
@@ -191,56 +225,35 @@ void handle_signal(int signal) {
     running = false;
 }
 
-void handle_connection(int client_fd, const char *bomb_path) {
-    int bomb_fd = open(bomb_path, O_RDONLY);
-    if (bomb_fd == -1) {
-        perror("Failed to open bomb file");
-        const char *err_500 = "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n";
-        write_all(client_fd, err_500, strlen(err_500));
-        return;
+void handle_connection(int client_fd, const server_config_t *config) {
+    if (write_all(client_fd, config->header, (size_t)config->header_len) == -1) return;
+
+    // sendfile with an explicit offset uses pread semantics: it never touches
+    // the shared bomb_fd's file position, so workers can stream concurrently.
+    off_t offset = 0;
+    while (offset < config->bomb_size) {
+        ssize_t sent = sendfile(client_fd, config->bomb_fd, &offset, (size_t)(config->bomb_size - offset));
+        if (sent == -1) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EPIPE || errno == ECONNRESET) return;
+            perror("Failed to sendfile");
+            return;
+        }
+        if (sent == 0) return;
     }
 
-    struct stat file_stat;
-    if (fstat(bomb_fd, &file_stat) == -1) {
-        perror("Failed to stat bomb file");
-        close(bomb_fd);
-        return;
+    // Lingering close: close() with unread request bytes still buffered makes
+    // the kernel send RST, which discards queued send data and truncates the
+    // payload. Send FIN, then drain so the recv buffer is empty at close().
+    // Bounded by the recv timeout (idle peer) and DRAIN_LIMIT (a peer that
+    // keeps sending can't pin the worker; we accept a possible RST against it).
+    shutdown(client_fd, SHUT_WR);
+    char sink[4096];
+    size_t drained = 0;
+    ssize_t n;
+    while (drained < DRAIN_LIMIT && (n = read(client_fd, sink, sizeof(sink))) > 0) {
+        drained += (size_t)n;
     }
-
-    char header[512];
-    int header_len = snprintf(header, sizeof(header),
-                              "HTTP/1.1 200 OK\r\n"
-                              "Cache-Control: no-cache, no-store, must-revalidate\r\n"
-                              "Content-Encoding: gzip\r\n"
-                              "Content-Type: application/octet-stream\r\n"
-                              "Content-Length: %jd\r\n"
-                              "Connection: close\r\n"
-                              "\r\n",
-                              (intmax_t)file_stat.st_size);
-    if (header_len < 0 || (size_t)header_len >= sizeof(header)) {
-        fprintf(stderr, "Failed to build response header\n");
-        close(bomb_fd);
-        return;
-    }
-
-    if (write_all(client_fd, header, (size_t)header_len) == -1) {
-        close(bomb_fd);
-        return;
-    }
-
-    printf("[BOMB DEPLOYED]\n");
-
-    char buffer[CHUNK_SIZE];
-    ssize_t bytes_read;
-    while ((bytes_read = read(bomb_fd, buffer, sizeof(buffer))) > 0) {
-        if (write_all(client_fd, buffer, (size_t)bytes_read) == -1) break;
-    }
-
-    if (bytes_read == -1) {
-        perror("Failed to read from file");
-    }
-
-    close(bomb_fd);
 }
 
 ssize_t write_all(int fd, const void *buf, size_t count) {
@@ -354,6 +367,12 @@ static bool set_send_timeout(int fd, int seconds) {
         return false;
     }
 
+    // Bounds the lingering-close drain in handle_connection
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == -1) {
+        perror("Failed to set recv timeout");
+        return false;
+    }
+
     return true;
 }
 
@@ -410,7 +429,7 @@ static void worker_loop(int server_fd, const server_config_t *config) {
             continue;
         }
 
-        handle_connection(client_fd, config->bomb_path);
+        handle_connection(client_fd, config);
         close(client_fd);
     }
 }
