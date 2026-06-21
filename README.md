@@ -45,6 +45,9 @@ Options:
 
 Use nginx as a reverse proxy. An example configuration is in [nginx.conf](./nginx.conf).
 
+> [!CAUTION]
+> Do not enable `gunzip on;` on the proxy. The upstream serves a pre-gzipped body that inflates to ~10GB; `gunzip` would decompress it on your own nginx server and OOM you instead of the scanner.
+
 ## Related Article
 
 You can also read related article on [Zip Bombs](https://blog.haschek.at/2017/how-to-defend-your-website-with-zip-bombs.html).
